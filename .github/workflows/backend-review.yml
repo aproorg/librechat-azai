@@ -1,6 +1,7 @@
 name: Backend Unit Tests
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'api/**'
       - 'packages/**'
@@ -15,6 +16,7 @@ env:
 jobs:
   build:
     name: Build packages
+    if: contains(github.event.pull_request.labels.*.name, 'test')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

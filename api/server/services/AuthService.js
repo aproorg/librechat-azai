@@ -39,6 +39,8 @@ const {
 const { registerSchema } = require('~/strategies/validators');
 const { getAppConfig } = require('~/server/services/Config');
 const { sendEmail } = require('~/server/utils');
+const cookies = require('cookie');
+const openIdClient = require('openid-client');
 
 const domains = {
   client: process.env.DOMAIN_CLIENT,
@@ -846,6 +848,87 @@ const setOpenIDAuthTokens = (
 };
 
 /**
+ * Module-private map for deduplicating concurrent token-refresh calls.
+ * Key: refresh token value. Value: in-flight refresh promise.
+ *
+ * Within a single Node process, two requests that both observe an empty
+ * session for the same refresh token will share one IdP round-trip,
+ * preventing a refresh-token-rotation race.
+ *
+ * @type {Map<string, Promise<object | null>>}
+ */
+const inFlightRefreshes = new Map();
+
+/**
+ * Refresh OpenID tokens server-side using the persistent `refreshToken` cookie.
+ * Used to recover from session loss (e.g. in-memory session store wiped by a
+ * deployment) without forcing the user to re-authenticate.
+ *
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {string} userId - MongoDB user id, for the openid_user_id cookie.
+ * @returns {Promise<object | null>} The new tokenset on success, or null on any
+ *   failure (no cookie, IdP error, missing res, etc.). Caller treats null as
+ *   "could not refresh — fail closed."
+ */
+const refreshOpenIDTokensFromCookie = async (req, res, userId) => {
+  if (!res) {
+    logger.warn(
+      '[refreshOpenIDTokensFromCookie] No res object available; cannot persist rotated cookies',
+    );
+    return null;
+  }
+
+  const cookieHeader = req?.headers?.cookie;
+  const parsedCookies = cookieHeader ? cookies.parse(cookieHeader) : {};
+  const refreshToken = parsedCookies.refreshToken;
+  if (!refreshToken) {
+    return null;
+  }
+
+  const existing = inFlightRefreshes.get(refreshToken);
+  if (existing) {
+    return existing;
+  }
+
+  const refreshPromise = (async () => {
+    let openIdConfig;
+    try {
+      const { getOpenIdConfig } = require('~/strategies/openidStrategy');
+      openIdConfig = getOpenIdConfig();
+    } catch (err) {
+      logger.warn('[refreshOpenIDTokensFromCookie] getOpenIdConfig failed', err);
+      return null;
+    }
+
+    const refreshParams = process.env.OPENID_SCOPE ? { scope: process.env.OPENID_SCOPE } : {};
+
+    let tokenset;
+    try {
+      tokenset = await openIdClient.refreshTokenGrant(openIdConfig, refreshToken, refreshParams);
+    } catch (err) {
+      logger.warn('[refreshOpenIDTokensFromCookie] refreshTokenGrant failed', err);
+      return null;
+    }
+
+    const appAuthToken = setOpenIDAuthTokens(tokenset, req, res, userId, refreshToken);
+    if (!appAuthToken) {
+      logger.warn('[refreshOpenIDTokensFromCookie] setOpenIDAuthTokens returned no token');
+      return null;
+    }
+
+    return tokenset;
+  })();
+
+  inFlightRefreshes.set(refreshToken, refreshPromise);
+  try {
+    return await refreshPromise;
+  } finally {
+    inFlightRefreshes.delete(refreshToken);
+  }
+};
+
+/**
  * Resend Verification Email
  * @param {Object} req
  * @param {Object} req.body
@@ -916,4 +999,5 @@ module.exports = {
   setCloudFrontAuthCookies,
   requestPasswordReset,
   resendVerificationEmail,
+  refreshOpenIDTokensFromCookie,
 };

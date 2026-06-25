@@ -1,5 +1,18 @@
 const { SystemRoles } = require('librechat-data-provider');
 
+// Node 18 polyfill for `File` (required by undici via @librechat/agents transitive deps).
+// Newer undici versions reference globalThis.File at module load time.
+if (typeof globalThis.File === 'undefined') {
+  try {
+    // Available from Node 20; in Node 18 buffer doesn't export it.
+    globalThis.File = require('node:buffer').File;
+  } catch {
+    // Fallback minimal shim — only needs to exist as a constructor for undici's
+    // webidl checks at import time; tests don't actually instantiate it.
+    globalThis.File = class File {};
+  }
+}
+
 // --- Capture JwtStrategy inputs ---
 let capturedStrategyOptions;
 let capturedVerifyCallback;
@@ -46,10 +59,28 @@ jest.mock('~/server/services/Config', () => ({
 jest.mock('~/cache/getLogStores', () =>
   jest.fn().mockReturnValue({ get: jest.fn(), set: jest.fn() }),
 );
+jest.mock('~/server/services/AuthService', () => ({
+  refreshOpenIDTokensFromCookie: jest.fn(),
+}));
+jest.mock('./openidStrategy', () => ({
+  getOpenIdEmail: jest.fn((userinfo) => {
+    if (!userinfo) return undefined;
+    const claimKey = process.env.OPENID_EMAIL_CLAIM?.trim();
+    if (claimKey) {
+      const value = userinfo[claimKey];
+      if (typeof value === 'string' && value) {
+        return value;
+      }
+    }
+    const fallback = userinfo.email || userinfo.preferred_username || userinfo.upn;
+    return typeof fallback === 'string' ? fallback : undefined;
+  }),
+}));
 
 const { findOpenIDUser } = require('@librechat/api');
 const openIdJwtLogin = require('./openIdJwtStrategy');
 const { findUser, updateUser } = require('~/models');
+const { refreshOpenIDTokensFromCookie } = require('~/server/services/AuthService');
 
 function withEnv(env, callback) {
   const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
@@ -316,19 +347,34 @@ describe('openIdJwtStrategy – token source handling', () => {
     expect(user.federatedTokens.refresh_token).toBe('cookie-refresh');
   });
 
-  it('should set id_token to undefined when not available in session or cookies', async () => {
+  it('attempts refresh when neither session nor openid_id_token cookie has an idToken, and a refreshToken cookie is present', async () => {
+    refreshOpenIDTokensFromCookie.mockImplementation(async (req) => {
+      req.session = req.session ?? {};
+      req.session.openidTokens = {
+        accessToken: 'refreshed-access',
+        idToken: 'refreshed-id',
+        refreshToken: 'refreshed-refresh',
+      };
+      return {
+        access_token: 'refreshed-access',
+        id_token: 'refreshed-id',
+        refresh_token: 'refreshed-refresh',
+      };
+    });
+
     const req = {
       headers: {
         authorization: 'Bearer raw-bearer-token',
         cookie: 'openid_access_token=cookie-access; refreshToken=cookie-refresh',
       },
+      res: { cookie: jest.fn() },
     };
 
     const { user } = await invokeVerify(req, payload);
 
-    expect(user.federatedTokens.access_token).toBe('cookie-access');
-    expect(user.federatedTokens.id_token).toBeUndefined();
-    expect(user.federatedTokens.refresh_token).toBe('cookie-refresh');
+    expect(refreshOpenIDTokensFromCookie).toHaveBeenCalledTimes(1);
+    expect(user.federatedTokens.id_token).toBe('refreshed-id');
+    expect(user.federatedTokens.access_token).toBe('refreshed-access');
   });
 
   it('should keep id_token and access_token as distinct values from cookies', async () => {
@@ -533,5 +579,125 @@ describe('openIdJwtStrategy – OPENID_EMAIL_CLAIM', () => {
         openidIssuer: 'https://issuer.example.com',
       }),
     );
+  });
+});
+
+describe('openIdJwtStrategy – session refresh on empty session', () => {
+  const baseUser = {
+    _id: { toString: () => 'user-abc' },
+    role: SystemRoles.USER,
+    provider: 'openid',
+  };
+
+  const payload = {
+    sub: 'oidc-123',
+    email: 'test@example.com',
+    iss: 'https://issuer.example.com',
+    exp: 9999999999,
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    findOpenIDUser.mockResolvedValue({ user: { ...baseUser }, error: null, migration: false });
+    updateUser.mockResolvedValue({});
+    openIdJwtLogin(mockOpenIdConfig);
+  });
+
+  it('triggers refresh when session has refreshToken but no idToken, and no openid_id_token cookie', async () => {
+    refreshOpenIDTokensFromCookie.mockImplementation(async (req) => {
+      // Simulate setOpenIDAuthTokens repopulating the session
+      req.session.openidTokens = {
+        accessToken: 'fresh-access',
+        idToken: 'fresh-id',
+        refreshToken: 'fresh-refresh',
+      };
+      return {
+        access_token: 'fresh-access',
+        id_token: 'fresh-id',
+        refresh_token: 'fresh-refresh',
+      };
+    });
+
+    const fakeRes = { cookie: jest.fn() };
+    const req = {
+      headers: {
+        authorization: 'Bearer raw-bearer-token',
+        cookie: 'refreshToken=existing-refresh',
+      },
+      session: {
+        openidTokens: {
+          accessToken: 'stale-access',
+          // idToken intentionally missing
+          refreshToken: 'existing-refresh',
+        },
+      },
+      res: fakeRes,
+    };
+
+    const { user } = await invokeVerify(req, payload);
+
+    expect(refreshOpenIDTokensFromCookie).toHaveBeenCalledTimes(1);
+    expect(refreshOpenIDTokensFromCookie).toHaveBeenCalledWith(req, fakeRes, 'user-abc');
+    expect(user.federatedTokens.id_token).toBe('fresh-id');
+    expect(user.federatedTokens.access_token).toBe('fresh-access');
+  });
+
+  it('returns 401 (no user) when refresh helper returns null', async () => {
+    refreshOpenIDTokensFromCookie.mockResolvedValueOnce(null);
+
+    const req = {
+      headers: {
+        authorization: 'Bearer raw-bearer-token',
+        cookie: 'refreshToken=existing-refresh',
+      },
+      session: {},
+      res: { cookie: jest.fn() },
+    };
+
+    const { user, info } = await invokeVerify(req, payload);
+
+    expect(refreshOpenIDTokensFromCookie).toHaveBeenCalledTimes(1);
+    expect(user).toBe(false);
+    expect(info?.message).toMatch(/OIDC refresh failed/);
+  });
+
+  it('does not call refresh helper when neither session nor cookie has refreshToken', async () => {
+    const req = {
+      headers: {
+        authorization: 'Bearer raw-bearer-token',
+        // no refreshToken cookie, no openid_id_token cookie, empty session
+        cookie: 'token_provider=openid',
+      },
+      session: {},
+      res: { cookie: jest.fn() },
+    };
+
+    const { user, info } = await invokeVerify(req, payload);
+
+    expect(refreshOpenIDTokensFromCookie).not.toHaveBeenCalled();
+    expect(user).toBe(false);
+    expect(info?.message).toMatch(/no refresh cookie/);
+  });
+
+  it('does not call refresh helper when session already has all tokens, even if refresh cookie is present', async () => {
+    const req = {
+      headers: {
+        authorization: 'Bearer raw-bearer-token',
+        cookie: 'refreshToken=existing-refresh',
+      },
+      session: {
+        openidTokens: {
+          accessToken: 'session-access',
+          idToken: 'session-id',
+          refreshToken: 'session-refresh',
+        },
+      },
+      res: { cookie: jest.fn() },
+    };
+
+    const { user } = await invokeVerify(req, payload);
+
+    expect(refreshOpenIDTokensFromCookie).not.toHaveBeenCalled();
+    expect(user.federatedTokens.id_token).toBe('session-id');
   });
 });

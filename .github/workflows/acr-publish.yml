@@ -38,7 +38,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile.multi
+          file: Dockerfile
+          target: node
           platforms: linux/amd64
           push: true
           tags: |
